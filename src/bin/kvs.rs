@@ -1,7 +1,9 @@
 use clap::{Arg, Command};
-use std::process::exit;
+use std::{process::exit, env::current_dir};
 
-fn main() {
+use kvs::Result;
+
+fn main() -> Result<()> {
     
     let matches = Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
@@ -29,17 +31,33 @@ fn main() {
 
     match matches.subcommand() {
         Some(("set", _matches)) => {
-            eprintln!("unimplemented");
-            exit(1);
+            let mut store = kvs::KvStore::open(current_dir()?)?;
+            store.set(_matches.get_one::<String>("KEY").expect("required").to_string(), 
+                    _matches.get_one::<String>("VALUE").expect("required").to_string())?;
+            //println!("Set successfully");
         }
         Some(("get", _matches)) => {
-            eprintln!("unimplemented");
-            exit(1);
+            let mut store = kvs::KvStore::open(current_dir()?)?;
+            match store.get(_matches.get_one::<String>("KEY").expect("required").to_string())? {
+                None => {
+                    println!("Key not found");
+                },
+                Some(value) => {
+                    println!("{value}");
+                }
+            }
         }
         Some(("rm", _matches)) => {
-            eprintln!("unimplemented");
-            exit(1);
+            let mut store = kvs::KvStore::open(current_dir()?)?;
+            match store.remove(_matches.get_one::<String>("KEY").expect("required").to_string()) {
+                Ok(_) => {},
+                Err(_) => {
+                    println!("Key not found");
+                    exit(1);
+                }
+            }
         }
         _ => unreachable!(),
     }
+    Ok(())
 }
