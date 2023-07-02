@@ -1,7 +1,13 @@
+//#![feature(test)]
+#![allow(soft_unstable)]
 
+pub mod engines;
+pub mod proto;
+pub mod thread_pool;
 
-pub mod kv;
-
-pub use kv::KvStore;
-pub use kv::Result;
-
+pub use engines::sled::SledStore;
+pub use engines::kv::KvStore;
+pub use engines::KvsEngine;
+pub use engines::Result;
+pub use proto::Command;
+pub use proto::Record;
