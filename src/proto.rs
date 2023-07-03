@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum Command {
@@ -13,4 +13,3 @@ pub struct Record {
     pub key: String,
     pub value: String,
 }
-

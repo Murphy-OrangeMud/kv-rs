@@ -1,17 +1,20 @@
-use clap::{Command, arg};
+use clap::{arg, Command};
 use kvs::engines::sled::SledStore;
-use serde::{Serialize, Deserialize};
-use std::{process::exit, env::current_dir};
-use std::io::{Read, Write, BufReader, BufWriter};
-use kvs::{Command as kCommand, Record, KvsEngine, KvStore, Result};
-use std::net::{TcpListener};
-use log::{info, warn, error, debug};
-use stderrlog::{self, Timestamp, LogLevelNum};
-use std::path::PathBuf;
+use kvs::thread_pool::{SharedQueueThreadPool, RayonThreadPool};
+use kvs::{Command as kCommand, KvStore, KvsEngine, Record, Result};
+use kvs::{NaiveThreadPool, ThreadPool};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::{env::current_dir, process::exit};
+use stderrlog::{self, LogLevelNum, Timestamp};
 
 #[derive(Serialize, Deserialize)]
-struct KvServer {
+pub struct KvServer {
     engine: String,
 }
 
@@ -30,50 +33,75 @@ impl KvServer {
         f.flush()?;
         Ok(server)
     }
-    
-    fn set(&self, mut store: impl KvsEngine, key: String, value: String, mut writer: impl Write) -> Result<()> {
-        match store.set(key, value) {
-            Ok(_) => {
-                writer.write("Successful set operation".as_bytes())?
-            },
-            Err(e) => {
-                writer.write("ERROR: ".as_bytes())? + writer.write(e.to_string().as_bytes())?
+
+    fn serve(socket: TcpStream, store: impl KvsEngine) {
+        info!("New client: {}", socket.peer_addr().unwrap());
+
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut writer = BufWriter::new(socket);
+
+        // body
+        let mut buf: [u8; 4] = [0; 4];
+        let n = reader.read(&mut buf).unwrap();
+        if n != buf.len() {
+            error!("Corrupted request, not reading enough bytes");
+        }
+        // big end in network programming
+        let length = u32::from_be_bytes(buf);
+        debug!("The total packet length is: {length}");
+        let mut chunk = reader.take((length - 4).into());
+        debug!("{:?}", chunk);
+        let mut value = String::new();
+        let n = chunk.read_to_string(&mut value).unwrap();
+        debug!("{value}");
+        if n < (length - 4) as usize {
+            error!("Corrupted request, not reading enough bytes");
+        }
+        let record: Record = serde_json::from_str(&value).unwrap();
+        match record.cmd {
+            kCommand::Set => {
+                match store.set(record.key, record.value) {
+                    Ok(_) => writer.write("Successful set operation".as_bytes()).unwrap(),
+                    Err(e) => {
+                        writer.write("ERROR: ".as_bytes()).unwrap()
+                            + writer.write(e.to_string().as_bytes()).unwrap()
+                    }
+                };
+                // socket.shutdown(Shutdown::Both)?;
             }
-        };
-        writer.flush()?;
-        Ok(())
+            kCommand::Get => {
+                match store.get(record.key.clone()).unwrap() {
+                    None => {
+                        writer
+                            .write("ERROR: NO such key in storage".as_bytes())
+                            .unwrap();
+                        warn!("NO such key in storage: {}", record.key);
+                    }
+                    Some(value) => {
+                        let len = value.len() as u32;
+                        // writer.write(&len.to_be_bytes())?;
+                        writer.write(value.as_bytes()).unwrap();
+                    }
+                };
+                // socket.shutdown(Shutdown::Both)?;
+            }
+            kCommand::Remove => {
+                match store.remove(record.key) {
+                    Ok(_) => writer
+                        .write("Successful remove operation".as_bytes())
+                        .unwrap(),
+                    Err(e) => {
+                        writer.write("ERROR: ".as_bytes()).unwrap()
+                            + writer.write(e.to_string().as_bytes()).unwrap()
+                    }
+                };
+                // socket.shutdown(Shutdown::Both)?;
+            }
+        }
+        writer.flush().unwrap();
     }
 
-    fn get(&self, mut store: impl KvsEngine, key: String, mut writer: impl Write) -> Result<()> {
-        match store.get(key.clone())? {
-            None => {
-                writer.write("ERROR: NO such key in storage".as_bytes())?;
-                warn!("NO such key in storage: {}", key);
-            },
-            Some(value) => {
-                let len = value.len() as u32;
-                //writer.write(&len.to_be_bytes())?;
-                writer.write(value.as_bytes())?;
-            }
-        };
-        writer.flush()?;
-        Ok(())
-    }
-
-    fn remove(&self, mut store: impl KvsEngine, key: String, mut writer: impl Write) -> Result<()> {
-        match store.remove(key) {
-            Ok(_) => {
-                writer.write("Successful remove operation".as_bytes())?
-            },
-            Err(e) => {
-                writer.write("ERROR: ".as_bytes())? + writer.write(e.to_string().as_bytes())?
-            }
-        };
-        writer.flush()?;
-        Ok(())
-    }
-
-    pub fn start(&mut self, ip: &String) -> Result<()> {
+    pub fn start(&self, ip: &String, store: impl KvsEngine, pool: impl ThreadPool) -> Result<()> {
         let engine = &self.engine;
         info!(env!("CARGO_PKG_VERSION"));
         info!("ENGINE: {engine}, IP: {ip}");
@@ -81,110 +109,23 @@ impl KvServer {
         let listener = TcpListener::bind(ip)?;
         info!("Listen at {ip}");
 
-        loop {
-            match listener.accept() {
-                Ok((socket, addr)) => {
-                    info!("New client: {addr}");
-                    let mut reader = BufReader::new(socket.try_clone()?);
-                    let writer = BufWriter::new(socket);
-                    // TODO: add authentication system
-                    /* let mut buf: [u8; 8] = [0; 8];
-                    let n = socket.read(&mut buf)?;
-                    if n != buf.len() {
-                        error!("Corrupted request, not reading enough bytes");
-                    }
-                    let all_len = u64::from_be_bytes(buf);
-                    let mut all_chunk = socket.take(all_len - 8);
-                    let mut buffer = String::new();
-                    let n = all_chunk.read_to_string(&mut buffer)?;
-                    if n != all_len as usize {
-                        error!("Corrupted request, not reading enough bytes");
-                    }
-
-                    let username_len = match buffer[0..1].parse::<u8>() {
-                        Ok(len) => len,
-                        Err(_) => {
-                            error!("Parse request error");
-                            error!("Request format: |    0x08    |     0x01     |     ..username_len..     |          0x04         | ..payload_len.. |");
-                            error!("                | packet_len | username_len | username (less than 255) | payload_len (command) |     payload     |");
-                            continue;
-                        }
-                    };
-
-                    let x = (1 + username_len) as i32;
-
-                    let mut buf: [u8; 1] = [0; 1];
-                    let n = all_chunk.read(&mut buf)?;
-                    if n != buf.len() {
-                        error!("Corrupted request, not reading enough bytes");
-                    }
-
-                    let mut chunk = all_chunk.take(buf[0].into());
-                    let mut username = String::new();
-                    let n = chunk.read_to_string(&mut username)?;
-                    if n < buf[0] as usize {
-                        error!("Corrupted request, not reading enough bytes");
-                        continue;
-                    } */
-
-                    // body
-                    let mut buf: [u8; 4] = [0; 4];
-                    let n = reader.read(&mut buf)?;
-                    if n != buf.len() {
-                        error!("Corrupted request, not reading enough bytes");
-                    }
-                    // big end in network programming
-                    let length = u32::from_be_bytes(buf);
-                    debug!("The total packet length is: {length}");
-                    let mut chunk = reader.take((length - 4).into());
-                    debug!("{:?}", chunk);
-                    let mut value = String::new();
-                    let n = chunk.read_to_string(&mut value)?;
-                    debug!("{value}");
-                    if n < (length - 4) as usize {
-                        error!("Corrupted request, not reading enough bytes");
-                        continue;
-                    }
-                    let record: Record = serde_json::from_str(&value)?;
-                    match record.cmd {
-                        kCommand::Set => {
-                            if engine == "kvs" {
-                                self.set(KvStore::open(current_dir()?)?, record.key, record.value, writer)?;
-                            } else if engine == "sled" {
-                                self.set(SledStore::open(current_dir()?)?, record.key, record.value, writer)?;
-                            }
-                            // socket.shutdown(Shutdown::Both)?;
-                        },
-                        kCommand::Get => {
-                            if engine == "kvs" {
-                                self.get(KvStore::open(current_dir()?)?, record.key, writer)?;
-                            } else if engine == "sled" {
-                                self.get(SledStore::open(current_dir()?)?, record.key, writer)?;
-                            }
-                            // socket.shutdown(Shutdown::Both)?;
-                        },
-                        kCommand::Remove => {
-                            if engine == "kvs" {
-                                self.remove(KvStore::open(current_dir()?)?, record.key, writer)?;
-                            } else if engine == "sled" {
-                                self.remove(SledStore::open(current_dir()?)?, record.key, writer)?;
-                            }
-                            // socket.shutdown(Shutdown::Both)?;
-                        }
-                    }
-                    // writer.flush()?;
-                },
-                Err(e) => {
-                    error!("Error accepting connections: {e}");
-                }
-            }
+        for socket in listener.incoming() {
+            let n_store = store.clone();
+            pool.spawn(move || Self::serve(socket.unwrap(), n_store))
         }
+
+        Ok(())
     }
 }
 
 fn main() -> Result<()> {
-    stderrlog::new().module(module_path!()).timestamp(Timestamp::Second).verbosity(LogLevelNum::Debug).init().unwrap();
-    
+    stderrlog::new()
+        .module(module_path!())
+        .timestamp(Timestamp::Second)
+        .verbosity(LogLevelNum::Debug)
+        .init()
+        .unwrap();
+
     let matches = Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
@@ -202,21 +143,32 @@ fn main() -> Result<()> {
                   if there is previously persisted data 
                   then the default is the engine already in use. 
                   If data was previously persisted with a different engine than selected, 
-                  print an error and exit with a non-zero exit code.")
+                  print an error and exit with a non-zero exit code."),
+                arg!(-t --thread-pool <THREADPOOL_NAME> "This option is for benchmark. 
+                Specify the threadpool used. It must be one of naive, shared_queue or rayon"),
+                arg!(-n --worker-num <WORKER_NUM> "This option is for benchmark. 
+                Specify the worker num of the thread pool. Default 8")
             ]
         ).get_matches();
-        
+
     let default_ip = "127.0.0.1:4000".to_string();
     let default_engine = "kvs".to_string();
+    let default_thread_pool = "shared_queue".to_string();
+    let default_worker_num = 8;
+
     let ip = matches.get_one::<String>("addr").unwrap_or(&default_ip);
-    let engine = matches.get_one::<String>("engine").unwrap_or(&default_engine);
+    let engine = matches
+        .get_one::<String>("engine")
+        .unwrap_or(&default_engine);
+    let thread_pool = matches.get_one::<String>("thread-pool").unwrap_or(&default_engine);
+    let worker_num = matches.get_one::<u32>("worker-num").unwrap_or(&default_worker_num);
 
     if engine != "kvs" && engine != "sled" {
         error!("Invalid engine. Must be 'kvs' or 'sled'");
         exit(1);
     }
 
-    let mut server: KvServer;
+    let server: KvServer;
     let path = current_dir()?.join("config.json");
     if path.exists() {
         server = KvServer::load(path)?;
@@ -228,7 +180,13 @@ fn main() -> Result<()> {
         server = KvServer::new(path, engine.to_string())?;
     }
 
-    server.start(ip)?;
+    let pool = SharedQueueThreadPool::new(8)?;
+
+    if engine == "kvs" {
+        server.start(ip, KvStore::open(current_dir()?)?, pool)?;
+    } else if engine == "sled" {
+        server.start(ip, SledStore::open(current_dir()?)?, pool)?;
+    }
 
     Ok(())
 }
