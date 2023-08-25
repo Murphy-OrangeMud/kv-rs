@@ -1,5 +1,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use kvs::{KvStore, KvsEngine, SledStore};
+use kvs::{
+    KvServer, KvStore, KvsEngine, RayonThreadPool, SharedQueueThreadPool, SledStore, ThreadPool,
+};
 use rand::prelude::*;
 use tempfile::TempDir;
 
@@ -72,5 +74,128 @@ fn get_bench(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, set_bench, get_bench);
+fn read_bench(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_bench");
+    for i in &vec![4, 8, 12, 16, 24, 32] {
+        group.bench_with_input(format!("shared_queue_kvs_{i}"), i, |b, i| {
+            let temp_dir = TempDir::new().unwrap();
+            let mut store = KvStore::open(temp_dir.path()).unwrap();
+            let pool = SharedQueueThreadPool::new(*i).unwrap();
+            for key_i in 1..16 {
+                store
+                    .set(format!("key{}", key_i), "value".to_string())
+                    .unwrap();
+            }
+            let mut rng = SmallRng::from_seed([1; 16]);
+            b.iter(|| {
+                let n_store = store.clone();
+                let n = rng.gen_range(1, 32);
+                pool.spawn(move || {
+                    n_store.get(format!("key{}", n)).unwrap();
+                });
+            })
+        });
+    }
+
+    for i in &vec![4, 8, 12, 16, 24, 32] {
+        group.bench_with_input(format!("rayon_kvs_{i}"), i, |b, i| {
+            let temp_dir = TempDir::new().unwrap();
+            let mut store = KvStore::open(temp_dir.path()).unwrap();
+            let pool = RayonThreadPool::new(*i).unwrap();
+            for key_i in 1..16 {
+                store
+                    .set(format!("key{}", key_i), "value".to_string())
+                    .unwrap();
+            }
+            let mut rng = SmallRng::from_seed([1; 16]);
+            b.iter(|| {
+                let n_store = store.clone();
+                let n = rng.gen_range(1, 32);
+                pool.spawn(move || {
+                    n_store.get(format!("key{}", n)).unwrap();
+                });
+            })
+        });
+    }
+
+    for i in &vec![4, 8, 12, 16, 24, 32] {
+        group.bench_with_input(format!("rayon_sled_{i}"), i, |b, i| {
+            let temp_dir = TempDir::new().unwrap();
+            let mut store = SledStore::open(temp_dir.path()).unwrap();
+            let pool = RayonThreadPool::new(*i).unwrap();
+            for key_i in 1..16 {
+                store
+                    .set(format!("key{}", key_i), "value".to_string())
+                    .unwrap();
+            }
+            let mut rng = SmallRng::from_seed([1; 16]);
+            b.iter(|| {
+                let n_store = store.clone();
+                let n = rng.gen_range(1, 32);
+                pool.spawn(move || {
+                    n_store.get(format!("key{}", n)).unwrap();
+                });
+            })
+        });
+    }
+}
+
+fn write_bench(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_bench");
+    for i in &vec![4, 8, 12, 16, 24, 32] {
+        group.bench_with_input(format!("shared_queue_kvs_{i}"), i, |b, i| {
+            let temp_dir = TempDir::new().unwrap();
+            let mut store = KvStore::open(temp_dir.path()).unwrap();
+            let pool = SharedQueueThreadPool::new(*i).unwrap();
+            let mut rng = SmallRng::from_seed([1; 16]);
+            b.iter(|| {
+                let n_store = store.clone();
+                let n = rng.gen_range(1, 32);
+                pool.spawn(move || {
+                    n_store
+                        .set(format!("key{}", n), format!("value{}", n))
+                        .unwrap();
+                });
+            })
+        });
+    }
+
+    for i in &vec![4, 8, 12, 16, 24, 32] {
+        group.bench_with_input(format!("rayon_kvs_{i}"), i, |b, i| {
+            let temp_dir = TempDir::new().unwrap();
+            let mut store = KvStore::open(temp_dir.path()).unwrap();
+            let pool = RayonThreadPool::new(*i).unwrap();
+            let mut rng = SmallRng::from_seed([1; 16]);
+            b.iter(|| {
+                let n_store = store.clone();
+                let n = rng.gen_range(1, 32);
+                pool.spawn(move || {
+                    n_store
+                        .set(format!("key{}", n), format!("value{}", n))
+                        .unwrap();
+                });
+            })
+        });
+    }
+
+    for i in &vec![4, 8, 12, 16, 24, 32] {
+        group.bench_with_input(format!("rayon_sled_{i}"), i, |b, i| {
+            let temp_dir = TempDir::new().unwrap();
+            let mut store = SledStore::open(temp_dir.path()).unwrap();
+            let pool = RayonThreadPool::new(*i).unwrap();
+            let mut rng = SmallRng::from_seed([1; 16]);
+            b.iter(|| {
+                let n_store = store.clone();
+                let n = rng.gen_range(1, 32);
+                pool.spawn(move || {
+                    n_store
+                        .set(format!("key{}", n), format!("value{}", n))
+                        .unwrap();
+                });
+            })
+        });
+    }
+}
+
+criterion_group!(benches, set_bench, get_bench, read_bench, write_bench);
 criterion_main!(benches);

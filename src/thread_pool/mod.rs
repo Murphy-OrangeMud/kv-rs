@@ -2,9 +2,9 @@ pub mod naive;
 pub mod rayon;
 pub mod shared_queue;
 
+pub use crate::thread_pool::rayon::RayonThreadPool;
 pub use naive::NaiveThreadPool;
 pub use shared_queue::SharedQueueThreadPool;
-pub use crate::thread_pool::rayon::RayonThreadPool;
 
 use crate::Result;
 

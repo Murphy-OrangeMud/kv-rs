@@ -17,6 +17,7 @@ byteorder = "1.4.3"
 sled = "0.34.7"
 dashmap = "5.4.0"
 rayon = "1.7.0"
+skiplist = "0.5.1"
 
 assert_cmd = "0.11"
 criterion = "0.3"

@@ -1,10 +1,10 @@
-use std::thread;
-use std::sync::mpsc::{self, Sender, Receiver};
-use std::sync::Arc;
-use std::sync::Mutex;
+use log::debug;
 use serde_json::error;
 use std::process::exit;
-use log::debug;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
 
 use crate::{Result, ThreadPool};
 
@@ -19,7 +19,7 @@ impl ThreadPool for SharedQueueThreadPool {
         let consumer = Arc::new(Mutex::new(consumer));
         for _ in 0..worker_num {
             let n_consumer = Arc::clone(&consumer);
-            thread::spawn(move||{
+            thread::spawn(move || {
                 worker_loop(n_consumer);
             });
         }
