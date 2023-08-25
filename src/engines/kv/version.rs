@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::{default, string};
 
+use assert_cmd::assert;
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,7 @@ use super::{
     default_options, kL0_CompactionTrigger, make_file_name, InternalKey, KvStore, Options,
 };
 
+// TODO: Add refs everywhere
 #[derive(Serialize, Deserialize, Eq)]
 pub struct FileMetaData {
     pub num: i32,
@@ -68,7 +70,7 @@ pub struct VersionSet {
     prev_log_number: u64,
     next_file_number: u64,
 
-    compact_pointer: [InternalKey; NUM_LEVELS as usize],
+    compact_pointer: [Option<InternalKey>; NUM_LEVELS as usize],
 }
 
 impl VersionSet {
@@ -91,10 +93,11 @@ impl VersionSet {
         // apply edit to self
         // update compaction pointers
         for i in 0..edit.compact_pointers.len() {
-            self.compact_pointer[edit.compact_pointers[i].0 as usize] = edit.compact_pointers[i].1;
+            self.compact_pointer[edit.compact_pointers[i].0 as usize] =
+                Some(edit.compact_pointers[i].1);
         }
 
-        let mut level_added_files: [BTreeSet<FileMetaData>; NUM_LEVELS as usize] =
+        let mut level_added_files: [BTreeSet<Arc<FileMetaData>>; NUM_LEVELS as usize] =
             Default::default();
         let mut level_deleted_files: [HashSet<i32>; NUM_LEVELS as usize] = Default::default();
         // delete files
@@ -107,13 +110,8 @@ impl VersionSet {
             if !level_deleted_files[added_file_set_kvp.0 as usize]
                 .remove(&(added_file_set_kvp.1.num as i32))
             {
-                level_added_files[added_file_set_kvp.0 as usize].insert(FileMetaData {
-                    num: added_file_set_kvp.1.num,
-                    size: added_file_set_kvp.1.size,
-                    refs: added_file_set_kvp.1.refs,
-                    smallest_key: added_file_set_kvp.1.smallest_key,
-                    largest_key: added_file_set_kvp.1.largest_key,
-                });
+                level_added_files[added_file_set_kvp.0 as usize]
+                    .insert(Arc::clone(&added_file_set_kvp.1));
             }
         }
 
@@ -123,7 +121,7 @@ impl VersionSet {
             vset: Arc::new(self.to_owned()),
             compaction_score: -1.0,
             compaction_level: -1,
-            file_to_compact: None,
+            refs: 0, // TODO:
         };
 
         for level in 0..NUM_LEVELS {
@@ -144,7 +142,9 @@ impl VersionSet {
                         let mut files = &mut v.files[level as usize];
                         if level > 0 && !files.is_empty() {
                             // Must not overlap
-                            assert!(files[files.len() - 1].largest_key < base_files[idx].smallest_key)
+                            assert!(
+                                files[files.len() - 1].largest_key < base_files[idx].smallest_key
+                            )
                         }
                         files.push(base_files[idx]);
                     }
@@ -155,12 +155,22 @@ impl VersionSet {
                         // Must not overlap
                         assert!(files[files.len() - 1].largest_key < added_file.smallest_key)
                     }
-                    files.push(Arc::new(added_file));
+                    files.push(Arc::clone(&added_file));
+                }
+            }
+            while idx < base_files.len() {
+                if !level_deleted_files[level as usize].contains(&base_files[idx].num) {
+                    let mut files = &mut v.files[level as usize];
+                    if level > 0 && !files.is_empty() {
+                        // Must not overlap
+                        assert!(files[files.len() - 1].largest_key < base_files[idx].smallest_key)
+                    }
+                    files.push(base_files[idx]);
                 }
             }
         }
 
-        // Why calculating in this way?
+        // Finalize
         let mut best_level = -1;
         let mut best_score: f64 = -1.0;
         for level in 0..NUM_LEVELS - 1 {
@@ -181,37 +191,41 @@ impl VersionSet {
         v.compaction_level = best_level;
         v.compaction_score = best_score;
 
+        // We don't consider manifest here
+        // Append version to version_set
+        self.append_version(v);
         Ok(())
     }
 
     fn append_version(&mut self, v: Version) {
+        // v is the current version now
         self.current = Arc::new(v);
+        self.versions.push(Arc::clone(&self.current));
     }
 
-    pub fn current_num_level_files(&self) -> u64 {
-        unimplemented!();
+    pub fn current_num_level_files(&self, level: i32) -> u64 {
+        assert!(level >= 0 && level < NUM_LEVELS);
+        self.current.files[level as usize].len() as u64
     }
 
     pub fn new_file_number(&self) -> u64 {
-        unimplemented!();
+        self.next_file_number += 1;
+        self.next_file_number - 1
     }
 
     pub fn pick_compaction(&self) -> Option<Compaction> {
         // let mut c = Compaction::new();
-        let size_compaction = self.current.compaction_score >= 1.0;
-        let seek_compaction = self.current.file_to_compact.is_some();
         let mut level: i32;
         let mut c: Compaction;
 
-        if size_compaction {
+        if self.current.compaction_score >= 1.0 {
             level = self.current.compaction_level;
+            assert!(level >= 0 && level + 1 < NUM_LEVELS);
             c = Compaction::new(level);
 
-            // TODO: What is compact pointer?
-            // TODO: What is c.inputs
             for i in 0..self.current.files[level as usize].len() {
-                if self.compact_pointer[level as usize] == Default::default()
-                    || self.compact_pointer[level as usize]
+                if self.compact_pointer[level as usize].is_none()
+                    || self.compact_pointer[level as usize].unwrap()
                         < self.current.files[level as usize][i].largest_key
                 {
                     c.inputs[0].push(self.current.files[level as usize][i]);
@@ -221,17 +235,102 @@ impl VersionSet {
             if c.inputs[0].is_empty() {
                 c.inputs[0].push(self.current.files[level as usize][0]);
             }
-        } else if seek_compaction {
-            // TODO: validate this implementation
-            level = self.current.file_to_compact_level;
-            c = Compaction::new(level);
-            c.inputs[0].push(Arc::new(self.current.file_to_compact.unwrap()));
+            c.version = Some(self.current);
+            self.current.refs += 1;
+
+            if level == 0 {
+                let (smallest, largest) = self.get_range(&c.inputs[0]);
+                self.current
+                    .get_overlap_inputs(level, &smallest, &largest, &mut c.inputs[0]);
+                assert!(!c.inputs[0].is_empty());
+            }
+            self.setup_other_inputs(&mut c);
         }
-        unimplemented!()
+        None
+    }
+
+    pub fn get_range(&self, inputs: &Vec<Arc<FileMetaData>>) -> (InternalKey, InternalKey) {
+        assert!(!inputs.is_empty());
+        let mut smallest: InternalKey;
+        let mut largest: InternalKey;
+        for i in 0..inputs.len() {
+            if i == 0 {
+                smallest = inputs[i].smallest_key;
+                largest = inputs[i].largest_key;
+            } else {
+                if inputs[i].smallest_key < smallest {
+                    smallest = inputs[i].smallest_key;
+                }
+                if inputs[i].largest_key > largest {
+                    largest = inputs[i].largest_key;
+                }
+            }
+        }
+        (smallest, largest)
+    }
+
+    pub fn get_range_2(
+        &self,
+        inputs1: &Vec<Arc<FileMetaData>>,
+        inputs2: &Vec<Arc<FileMetaData>>,
+    ) -> (InternalKey, InternalKey) {
+        let mut all = inputs1;
+        for obj in inputs2 {
+            all.push(obj.clone());
+        }
+        self.get_range(all)
+    }
+
+    pub fn setup_other_inputs(&self, c: &mut Compaction) {
+        let mut smallest: InternalKey;
+        let mut largest: InternalKey;
+        add_boundary_inputs(&self.current.files[c.level as usize], &mut c.inputs[0]);
+        (smallest, largest) = self.get_range(&c.inputs[0]);
+
+        let mut all_start: InternalKey;
+        let mut all_limit: InternalKey;
+        self.current
+            .get_overlap_inputs(c.level + 1, &smallest, &largest, &mut c.inputs[1]);
+        (all_start, all_limit) = self.get_range_2(&c.inputs[0], &c.inputs[1]);
+
+        if !c.inputs[1].is_empty() {
+            let mut expanded0 = Vec::<Arc<FileMetaData>>::new();
+            self.current
+                .get_overlap_inputs(c.level, &all_start, &all_limit, &mut expanded0);
+            add_boundary_inputs(&self.current.files[c.level as usize], &mut expanded0);
+            let input0_size = total_file_size(&c.inputs[0]);
+            let input1_size = total_file_size(&c.inputs[1]);
+            let expanded0_size = total_file_size(&expanded0);
+            if expanded0.len() > c.inputs[0].len()
+                && input1_size + expanded0_size
+                    < expanded_compaction_byte_size_limit(Options::default())
+            {
+                let mut new_start: InternalKey;
+                let mut new_limit: InternalKey;
+                let mut expanded1 = Vec::<Arc<FileMetaData>>::new();
+                (new_start, new_limit) = self.get_range(&expanded0);
+                self.current.get_overlap_inputs(c.level + 1, &new_start, &new_limit, &mut expanded1);
+                add_boundary_inputs(&self.current.files[c.level as usize + 1], &mut expanded1);
+                if expanded1.len() == c.inputs[1].len() {
+                    smallest = new_start;
+                    largest = new_limit;
+                    c.inputs[0] = expanded0;
+                    c.inputs[1] = expanded1;
+                    (all_start, all_limit) = self.get_range_2(&c.inputs[0], &c.inputs[1]);
+                }
+            }
+        }
+
+        if c.level + 2 < NUM_LEVELS {
+            self.current.get_overlap_inputs(c.level + 2, &all_start, &all_limit, &mut c.inputs[2]);
+        }
+
+        self.compact_pointer[c.level as usize] = Some(largest);
+        c.edit.compact_pointers.push((c.level, largest));
     }
 
     pub fn get(&self, meta: &FileMetaData, key: &InternalKey) -> Result<Option<(i64, usize)>> {
-        let file_name = make_file_name(meta.num, "dbt");
+        let file_name = make_file_name(meta.num as u64, "dbt");
 
         let file = File::open(self.db.path.join(file_name))?;
         let mut reader = BufReader::new(&file);
@@ -278,7 +377,8 @@ pub struct Version {
 
     compaction_score: f64,
     compaction_level: i32,
-    file_to_compact: Option<File>,
+    refs: u64,
+    // We don't consider stats here
 }
 
 impl Version {
@@ -353,6 +453,7 @@ impl Version {
                 &InternalKey {
                     sequence_num: MAX_SEQUENCE_NUM,
                     user_key: smallest_user_key.to_owned(),
+                    command: crate::engines::kv::Command::Seek,
                 },
             );
             if idx >= self.files[level as usize].len() {
@@ -370,8 +471,12 @@ impl Version {
     ) -> i32 {
         let mut level = 0;
         if !self.overlap_in_level(0, smallest_user_key, largest_user_key) {
-            let start = InternalKey::new(smallest_user_key, MAX_SEQUENCE_NUM);
-            let limit = InternalKey::new(largest_user_key, 0);
+            let start = InternalKey::new(
+                smallest_user_key,
+                MAX_SEQUENCE_NUM,
+                crate::engines::kv::Command::Seek,
+            );
+            let limit = InternalKey::new(largest_user_key, 0, crate::engines::kv::Command::Seek);
             let mut overlaps = Vec::<Arc<FileMetaData>>::new();
             while level < MAX_MEM_COMPACT_LEVEL {
                 if self.overlap_in_level(level + 1, smallest_user_key, largest_user_key) {
@@ -422,7 +527,7 @@ impl Version {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+
 pub struct VersionEdit {
     new_files: Vec<(i32, Arc<FileMetaData>)>,
     deleted_files: BTreeSet<(i32, u64)>, // file nums
@@ -462,7 +567,7 @@ impl VersionEdit {
 pub struct Compaction {
     pub level: i32,        // the level that is being compacted
     pub edit: VersionEdit, // the object that holds the edits to the descriptor done by this compaction
-    version: Option<Arc<Version>>,
+    pub version: Option<Arc<Version>>,
 
     // this: level; parent: level + 1; grandparent: level + 2;
     inputs: [Vec<Arc<FileMetaData>>; 3],
@@ -496,7 +601,7 @@ impl Compaction {
         }
     }
 
-    pub fn num_input_Files(&self, which: i32) -> Result<usize> {
+    pub fn num_input_files(&self, which: i32) -> Result<usize> {
         if which >= 3 {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -517,8 +622,8 @@ impl Compaction {
 
     pub fn is_trivial_move(&self) -> bool {
         // let vset = self.version.as_ref().unwrap().vset.as_ref();
-        self.num_input_Files(0).unwrap() == 1
-            && self.num_input_Files(1).unwrap() == 0
+        self.num_input_files(0).unwrap() == 1
+            && self.num_input_files(1).unwrap() == 0
             && total_file_size(&self.inputs[2]) <= max_grandparent_overlap_bytes(default_options)
     }
 
@@ -526,7 +631,7 @@ impl Compaction {
         for which in 0..2 {
             for i in 0..self.inputs[which as usize].len() {
                 self.edit
-                    .remove_file(self.level + which, self.inputs[which as usize][i].num);
+                    .remove_file(self.level + which, self.inputs[which as usize][i].num as u64);
             }
         }
     }
@@ -604,6 +709,10 @@ fn total_file_size(files: &Vec<Arc<FileMetaData>>) -> i64 {
     sum
 }
 
+fn expanded_compaction_byte_size_limit(options: Options) -> i64 {
+    options.max_file_size as i64 * 25
+}
+
 fn max_grandparent_overlap_bytes(options: Options) -> i64 {
     options.max_file_size as i64 * 10
 }
@@ -618,9 +727,60 @@ fn max_bytes_for_level(level: i32) -> u64 {
     result as u64
 }
 
+fn add_boundary_inputs(
+    level_files: &Vec<Arc<FileMetaData>>,
+    compaction_files: &mut Vec<Arc<FileMetaData>>,
+) {
+    if !compaction_files.is_empty() {
+        let mut largest = compaction_files[0].largest_key;
+        for i in 1..compaction_files.len() {
+            if compaction_files[i].largest_key > largest {
+                largest = compaction_files[i].largest_key;
+            }
+        }
+        let mut flag = true;
+        while flag {
+            let mut smallest_boundry_file: Option<Arc<FileMetaData>> = None;
+            for i in 0..level_files.len() {
+                if level_files[i].smallest_key > largest
+                    && level_files[i].smallest_key.user_key == largest.user_key
+                    && (smallest_boundry_file.is_none()
+                        || level_files[i].smallest_key
+                            < smallest_boundry_file.unwrap().smallest_key)
+                {
+                    smallest_boundry_file = Some(level_files[i]);
+                }
+            }
+            match smallest_boundry_file {
+                None => flag = false,
+                Some(file) => {
+                    compaction_files.push(file);
+                    largest = file.largest_key;
+                }
+            }
+        }
+    }
+}
+
+fn find_largest_key(files: &Vec<Arc<FileMetaData>>) -> Option<InternalKey> {
+    if files.is_empty() {
+        None
+    } else {
+        let mut largest = files[0].largest_key;
+        for i in 1..files.len() {
+            if files[i].largest_key > largest {
+                largest = files[i].largest_key;
+            }
+        }
+        Some(largest)
+    }
+}
+
 pub struct DBIterator {}
 
 impl Iterator for DBIterator {
-    type Item = string;
-    fn next(&mut self) -> Option<Self::Item> {}
+    type Item = String;
+    fn next(&mut self) -> Option<Self::Item> {
+        unimplemented!()
+    }
 }
