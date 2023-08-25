@@ -3,6 +3,7 @@ pub mod reader;
 pub mod version;
 pub mod writer;
 
+use assert_cmd::prelude::OutputAssertExt;
 use memtable::MemTable;
 use rand::AsByteSliceMut;
 use reader::{LogReader, VLogReader};
@@ -11,6 +12,7 @@ use writer::{LogWriter, VLogWriter};
 
 use crate::engines::kv::version::{DBIterator, FileMetaData};
 use crate::{engines::KVSError, KvsEngine, Result};
+use self::version::Compaction;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::borrow::BorrowMut;
@@ -23,8 +25,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
-
-use self::version::Compaction;
 
 const compact_threshold: u64 = 1 << 63;
 const compact_memtable_threshold: u64 = 1024 * 1024;
@@ -101,7 +101,7 @@ impl Default for Options {
     }
 }
 
-const default_options: Options = Options {
+const DEFAULT_OPTIONS: Options = Options {
     max_file_size: 2 * 1024 * 1024,
     write_buffer_size: 4 * 1024 * 1024,
     max_open_files: 1000,
@@ -113,6 +113,7 @@ const default_options: Options = Options {
 enum Command {
     Set,
     Remove,
+    Seek, // not sure
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,14 +129,14 @@ struct Record {
 pub struct KvStore {
     path: Arc<PathBuf>,
     // compact_daemon: Option<Arc<Mutex<thread::JoinHandle<()>>>>,
-    mem: Arc<Mutex<MemTable>>,
-    imm: Arc<Mutex<Option<MemTable>>>, // immutable
+    mem: Arc<MemTable>,
+    imm: Arc<Option<MemTable>>, // immutable
 
-    log: Arc<Mutex<LogWriter<File>>>,
-    vlog_writer: Arc<Mutex<VLogWriter<File>>>,
-    vlog_reader: Arc<Mutex<VLogReader<File>>>,
+    log: Arc<LogWriter<File>>,
+    vlog_writer: Arc<VLogWriter<File>>,
+    vlog_reader: Arc<VLogReader<File>>,
 
-    versions: Arc<Mutex<VersionSet>>,
+    versions: Arc<VersionSet>,
 
     pending_outputs: HashSet<u64>,
 
@@ -163,34 +164,34 @@ impl KvsEngine for KvStore {
 
     fn get(&self, key: String) -> Result<Option<String>> {
         // For now we don't consider snapshots
-        let ikey = InternalKey::new(&key, self.versions.borrow_mut().last_sequence());
-        if let Some((pos, n)) = self.mem.borrow_mut().get(ikey).unwrap() {
+        // For concurrency: add Arc ref to self.mem and self.imm
+        let ikey = InternalKey::new(&key, self.versions.last_sequence(), Command::Seek);
+        if let Some((pos, n)) = self.mem.get(ikey).unwrap() {
             if pos == -1 {
                 // deletion
                 return Ok(None);
             } else {
-                let value = self.vlog_reader.borrow_mut().get_value(pos as u64, n)?;
+                let value = self.vlog_reader.get_value(pos as u64, n)?;
                 Ok(Some(value))
             }
-        } else if self.imm.borrow().is_some()
-            && self.imm.borrow().unwrap().get(ikey).unwrap().is_some()
+        } else if self.imm.is_some()
+            && self.imm.unwrap().get(ikey).unwrap().is_some()
         {
-            let (pos, n) = self.imm.borrow().unwrap().get(ikey).unwrap().unwrap();
+            let (pos, n) = self.imm.unwrap().get(ikey).unwrap().unwrap();
             if pos == -1 {
                 // deletion
                 return Ok(None);
             } else {
-                let value = self.vlog_reader.borrow().get_value(pos as u64, n)?;
+                let value = self.vlog_reader.get_value(pos as u64, n)?;
                 Ok(Some(value))
             }
         } else {
-            let current = self.versions.borrow().current;
-            self.versions.borrow_mut().last_sequence = 0;
+            let current = self.versions.current;
+            self.versions.last_sequence = 0;
             if let Some((pos, n)) = current.get(ikey).unwrap() {
-                let value = self.vlog_reader.borrow().get_value(pos as u64, n)?;
-                if false {
-                    self.schedule_compaction();
-                }
+                let value = self.vlog_reader.get_value(pos as u64, n)?;
+                // Here we have stats update
+                self.schedule_compaction();
                 Ok(Some(value))
             } else {
                 Ok(None)
@@ -217,24 +218,20 @@ impl KvStore {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let mut store = Self::_open(path)?;
-        /* let n_store = store.clone();
-        store.compact_daemon = Some(Arc::new(Mutex::new(thread::spawn(move || loop {
-            thread::park();
-            n_store.compact();
-        })))); */
         Ok(store)
     }
 
     fn write(&self, buf: &[u8]) -> Result<()> {
-        // TODO: use shared queue
         // For now it's simple implementation
         self.make_room_for_write(false);
 
+        // 
+
         // write to log
-        self.log.lock().unwrap().add_record(buf);
+        self.log.add_record(buf);
 
         // write to values
-        self.vlog_writer.lock().unwrap().add_record(buf);
+        self.vlog_writer.add_record(buf);
 
         // insert to memtable
         // self.mem.read().unwrap().insert(key.clone(), pos, n);
@@ -256,7 +253,7 @@ impl KvStore {
         base: Option<&mut Version>,
     ) -> Result<()> {
         // mutex held
-        let number = self.versions.lock().unwrap().new_file_number();
+        let number = self.versions.new_file_number();
         self.pending_outputs.insert(number); // This is for concurrency
         debug!("Level 0 table {} compaction started", number);
 
@@ -313,28 +310,26 @@ impl KvStore {
     fn compact_memtable(&self) {
         // mutex held
         let mut edit = VersionEdit::new();
-        let mut base = self.versions.lock().unwrap().current;
+        let mut base = self.versions.current;
 
         // write_level0_table
-        // here imm must not be none
+        assert!(self.imm.is_some());
         // TODO: validate the implementation here
         let mut res = self.write_level0_table(
-            &self.imm.lock().unwrap().unwrap(),
+            &self.imm.unwrap(),
             &mut edit,
             Some(base.borrow_mut()),
         );
-
-        // TODO: Deal with concurrency
 
         if res.is_ok() {
             // Deal with logs
             edit.prev_log_number = Some(0); // TODO: why?
             edit.next_log_number = Some(self.log_file_number);
-            res = self.versions.lock().unwrap().log_and_apply(edit);
+            res = self.versions.log_and_apply(edit);
         }
 
         if res.is_ok() {
-            *self.imm.lock().unwrap() = None;
+            *self.imm = None;
             // TODO: store false in has_imm
             // TODO: remove obsolete files
         } else {
@@ -343,28 +338,21 @@ impl KvStore {
     }
 
     fn schedule_compaction(&self) {
-        // TODO: Concurrency
         self.background_compaction();
     }
 
     fn make_room_for_write(&self, force: bool) -> Result<()> {
         // We don't consider allow_latency sort of things
-        // let guard = self.compation_scheduler.lock().unwrap();
         loop {
-            /* if guard.bg_error {
-                break Err(std::io::Error::new(ErrorKind::Other, "Background error"))
-            } else */
-            if !force && self.mem.borrow().size() <= compact_memtable_threshold {
+            if !force && self.mem.size() <= compact_memtable_threshold {
                 break Ok(());
-            } else if self.imm.borrow().is_some() {
+            } else if self.imm.is_some() {
                 info!("Current memtable full, waiting...");
-                // guard.background_work_finished_signal.wait();
-            } else if self.versions.get_mut().current_num_level_files() >= kL0_StopWritesTrigger {
+            } else if self.versions.current_num_level_files(0) >= kL0_StopWritesTrigger {
                 // TODO: validate this implementation
                 info!("Too many files in level 0 files, waiting...");
-                // self.background_work_finished_signal.lock().unwrap().wait(guard);
-            } // else {
-            let new_log_number = self.versions.get_mut().new_file_number();
+            }
+            let new_log_number = self.versions.new_file_number();
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -388,28 +376,30 @@ impl KvStore {
         let mut file_number;
     }
 
-    fn finish_compaction_output_file() -> Result<()> {}
+    fn finish_compaction_output_file() -> Result<()> {
+
+    }
 
     fn background_compaction(&self) {
         // mutex held
 
-        if self.imm.lock().unwrap().is_some() {
+        if self.imm.is_some() {
             self.compact_memtable();
             return;
         }
 
         // We don't consider manual compaction at this moment
         // TODO: change c into Arc<Compaction>
-        let mut c = self.versions.lock().unwrap().pick_compaction();
+        let mut c = self.versions.pick_compaction();
 
         match c {
             None => {}
             Some(mut c) => {
                 if c.is_trivial_move() {
                     let f = c.input(0, 0);
-                    c.edit.remove_file(c.level, f.as_ref().num);
+                    c.edit.remove_file(c.level, f.num as u64);
                     c.edit.add_file(c.level + 1, f);
-                    match self.versions.lock().unwrap().log_and_apply(c.edit) {
+                    match self.versions.log_and_apply(c.edit) {
                         _ => {} // TODO: record background error
                     }
                     debug!("Moved {} to level {} {} byutes", f.num, c.level + 1, f.size);
@@ -417,9 +407,9 @@ impl KvStore {
                     // do compaction work
                     debug!(
                         "Compacting {} in {} + {} in {} files",
-                        c.num_input_Files(0).unwrap(),
+                        c.num_input_files(0).unwrap(),
                         c.level,
-                        c.num_input_Files(1).unwrap(),
+                        c.num_input_files(1).unwrap(),
                         c.level + 1
                     );
                     // TODO: update smallest snapshot (snapshot system)
@@ -432,11 +422,8 @@ impl KvStore {
                     let mut current_user_key: String;
                     let mut last_sequence_for_key = MAX_SEQUENCE_NUM;
                     while let Some((key, value)) = iterator.next() {
-                        // TODO: shutting down: memory order
-                        if self.imm.lock().unwrap().is_some() {
+                        if self.imm.is_some() {
                             self.compact_memtable();
-                            // TODO: background_work_finished_signal signal all
-                            // TODO: add mutex
                         }
 
                         // TODO: builder isn't null (what is the builder?)

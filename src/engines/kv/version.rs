@@ -17,7 +17,7 @@ use crate::engines::kv::{MAX_MEM_COMPACT_LEVEL, MAX_SEQUENCE_NUM, NUM_LEVELS};
 use crate::Result;
 
 use super::{
-    default_options, kL0_CompactionTrigger, make_file_name, InternalKey, KvStore, Options,
+    DEFAULT_OPTIONS, kL0_CompactionTrigger, make_file_name, InternalKey, KvStore, Options,
 };
 
 #[derive(Serialize, Deserialize, Eq)]
@@ -521,7 +521,7 @@ impl Version {
                 }
                 if level + 2 < NUM_LEVELS {
                     self.get_overlap_inputs(level + 2, &start, &limit, &mut overlaps);
-                    if total_file_size(&overlaps) > max_grandparent_overlap_bytes(default_options) {
+                    if total_file_size(&overlaps) > max_grandparent_overlap_bytes(DEFAULT_OPTIONS) {
                         break;
                     }
                 }
@@ -632,7 +632,7 @@ impl Compaction {
             grandparent_idx: 0,
             seen_key: false,
             overlapped_bytes: 0,
-            max_output_file_size: default_options.max_file_size as u64,
+            max_output_file_size: DEFAULT_OPTIONS.max_file_size as u64,
             level_ptr: [0; NUM_LEVELS as usize],
         }
     }
@@ -660,7 +660,7 @@ impl Compaction {
         // let vset = self.version.as_ref().unwrap().vset.as_ref();
         self.num_input_files(0).unwrap() == 1
             && self.num_input_files(1).unwrap() == 0
-            && total_file_size(&self.inputs[2]) <= max_grandparent_overlap_bytes(default_options)
+            && total_file_size(&self.inputs[2]) <= max_grandparent_overlap_bytes(DEFAULT_OPTIONS)
     }
 
     pub fn add_input_deletions(&mut self) {
@@ -711,7 +711,7 @@ impl Compaction {
         }
         self.seen_key = true;
 
-        if self.overlapped_bytes > max_grandparent_overlap_bytes(default_options) {
+        if self.overlapped_bytes > max_grandparent_overlap_bytes(DEFAULT_OPTIONS) {
             self.overlapped_bytes = 0;
             true
         } else {
